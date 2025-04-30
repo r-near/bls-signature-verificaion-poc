@@ -2,21 +2,14 @@ use amcl::bls381::bls381::utils::serialize_uncompressed_g1;
 use amcl::bls381::ecp::ECP;
 use amcl::bls381::fp2::FP2;
 use amcl::bls381::hash_to_curve::hash_to_field_fp2;
-use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::near_bindgen;
-use near_sdk::PanicOnDefault;
+use near_sdk::near;
 
-#[near_bindgen]
-#[derive(BorshSerialize, BorshDeserialize, PanicOnDefault)]
-struct BLSVerificationPOC {}
+#[near(contract_state)]
+#[derive(Default)]
+pub struct BLSVerificationPOC {}
 
-#[near_bindgen]
+#[near]
 impl BLSVerificationPOC {
-    #[init]
-    pub fn new() -> Self {
-        Self {}
-    }
-
     // WARNING: Before using this function, you must ensure the correctness of the public keys.
     // If the proof of possession (https://www.ietf.org/archive/id/draft-irtf-cfrg-bls-signature-05.html#name-proof-of-possession)
     // has not been verified, a Rogue Key Attack may be applied.
@@ -37,26 +30,26 @@ impl BLSVerificationPOC {
         msg_g2_01_sign.push(0);
         msg_g2_01_sign.append(&mut msg_g2_1);
 
-        let msg_g2 = near_sdk::env::bls12381_g2_sum(msg_g2_01_sign.as_slice());
+        let msg_g2 = near_sdk::env::bls12381_p2_sum(msg_g2_01_sign.as_slice());
         let pubkeys_ser: Vec<u8> = pubkeys.concat();
 
-        let pks_decompress = near_sdk::env::bls12381_g1_decompress(&pubkeys_ser);
+        let pks_decompress = near_sdk::env::bls12381_p1_decompress(&pubkeys_ser);
         let mut pks_decompress_with_sign = vec![0u8; 0];
         for i in 0..pks_decompress.len() / 96 {
             pks_decompress_with_sign.push(0);
             pks_decompress_with_sign.extend(&pks_decompress[i * 96..(i + 1) * 96]);
         }
 
-        let pk_agg = near_sdk::env::bls12381_g1_sum(&pks_decompress_with_sign);
+        let pk_agg = near_sdk::env::bls12381_p1_sum(&pks_decompress_with_sign);
 
         let mut gen = ECP::generator();
         gen.neg();
         let gneg = serialize_uncompressed_g1(&gen);
 
-        let sig_des = near_sdk::env::bls12381_g2_decompress(&signature);
+        let sig_des = near_sdk::env::bls12381_p2_decompress(&signature);
         let pairing_input = vec![pk_agg, msg_g2, gneg.to_vec(), sig_des].concat();
 
-        return near_sdk::env::bls12381_pairing_check(&pairing_input) == 1;
+        return near_sdk::env::bls12381_pairing_check(&pairing_input);
     }
 
     fn fp2_to_u8(u: &FP2, out: &mut [u8; 96]) {
@@ -67,16 +60,6 @@ impl BLSVerificationPOC {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use crate::BLSVerificationPOC;
-    use amcl::bls381::bls381::basic::G1_BYTES;
-    use amcl::bls381::bls381::core::map_to_curve_g2;
-    use amcl::bls381::bls381::utils::{
-        deserialize_g1, deserialize_g2, serialize_g1, serialize_uncompressed_g1,
-        serialize_uncompressed_g2,
-    };
-    use amcl::bls381::ecp::ECP;
-    use amcl::bls381::hash_to_curve::hash_to_field_fp2;
-    use amcl::bls381::pair;
     use bitvec::order::Lsb0;
     use bitvec::prelude::BitVec;
     use eth2_utility::consensus::compute_domain;
@@ -84,10 +67,10 @@ mod tests {
     use eth2_utility::consensus::DOMAIN_SYNC_COMMITTEE;
     use eth2_utility::consensus::{Network, NetworkConfig};
     use eth_types::eth2::{LightClientUpdate, PublicKeyBytes, SyncCommittee};
+    use near_workspaces::{Account, Contract};
     use serde_json::json;
     use std::str::FromStr;
     use tree_hash::TreeHash;
-    use workspaces::{Account, Contract};
 
     const WASM_FILEPATH: &str = "./target/wasm32-unknown-unknown/release/bls_verification_poc.wasm";
 
@@ -194,7 +177,7 @@ mod tests {
     }
 
     pub async fn get_contract(wasm_path: &str) -> (Account, Contract) {
-        let worker = workspaces::sandbox().await.unwrap();
+        let worker = near_workspaces::sandbox().await.unwrap();
 
         let owner = worker.root_account().unwrap();
 
@@ -218,22 +201,6 @@ mod tests {
             .unwrap();
 
         res.is_success()
-    }
-
-    pub async fn call_by_with_arg(
-        account: &Account,
-        contract: &Contract,
-        method_name: &str,
-        args: &serde_json::Value,
-    ) -> bool {
-        account
-            .call(contract.id(), method_name)
-            .args_json(args)
-            .max_gas()
-            .transact()
-            .await
-            .unwrap()
-            .is_success()
     }
 
     pub fn get_participant_pubkeys(
