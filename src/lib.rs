@@ -13,46 +13,88 @@ impl BLSVerificationPOC {
     // WARNING: Before using this function, you must ensure the correctness of the public keys.
     // If the proof of possession (https://www.ietf.org/archive/id/draft-irtf-cfrg-bls-signature-05.html#name-proof-of-possession)
     // has not been verified, a Rogue Key Attack may be applied.
+    /// Verifies a BLS signature against aggregated public keys.
+    /// Uses BLS12-381 curve with Ethereum's signature scheme.
     pub fn verify_bls_signature(msg: Vec<u8>, signature: Vec<u8>, pubkeys: Vec<Vec<u8>>) -> bool {
+        // 1. HASH MESSAGE TO G2 POINT
+        let hashed_msg_point = Self::hash_message_to_g2_point(msg);
+
+        // 2. AGGREGATE PUBLIC KEYS
+        let aggregated_pubkey = Self::aggregate_public_keys(pubkeys);
+
+        // 3. GET NEGATED GENERATOR POINT
+        let mut generator = ECP::generator();
+        generator.neg();
+        let negated_generator = serialize_uncompressed_g1(&generator);
+
+        // 4. DECOMPRESS SIGNATURE
+        let signature_decompressed = near_sdk::env::bls12381_p2_decompress(&signature);
+
+        // 5. PERFORM PAIRING CHECK: e(PK, H(m)) * e(-G, S) == 1
+        let pairing_input = [
+            aggregated_pubkey,
+            hashed_msg_point,
+            negated_generator.to_vec(),
+            signature_decompressed,
+        ]
+        .concat();
+
+        near_sdk::env::bls12381_pairing_check(&pairing_input)
+    }
+
+    /// Hashes a message to a point on the G2 curve using Ethereum's BLS scheme
+    fn hash_message_to_g2_point(msg: Vec<u8>) -> Vec<u8> {
+        // Ethereum domain separation tag
         let dst: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+        // 1. Hash message to two field elements
         let msg_fp2 = hash_to_field_fp2(msg.as_slice(), 2, dst)
             .expect("hash to field should not fail for given parameters");
 
+        // 2. Convert field elements to bytes format for NEAR runtime
         let mut msg_fp2_0: [u8; 96] = [0; 96];
         let mut msg_fp2_1: [u8; 96] = [0; 96];
         Self::fp2_to_u8(&msg_fp2[0], &mut msg_fp2_0);
         Self::fp2_to_u8(&msg_fp2[1], &mut msg_fp2_1);
 
-        let mut msg_g2_0 = near_sdk::env::bls12381_map_fp2_to_g2(&msg_fp2_0);
-        let mut msg_g2_1 = near_sdk::env::bls12381_map_fp2_to_g2(&msg_fp2_1);
-        let mut msg_g2_01_sign = vec![0u8; 1];
-        msg_g2_01_sign.append(&mut msg_g2_0);
-        msg_g2_01_sign.push(0);
-        msg_g2_01_sign.append(&mut msg_g2_1);
+        // 3. Map field elements to G2 points
+        let msg_g2_0 = near_sdk::env::bls12381_map_fp2_to_g2(&msg_fp2_0);
+        let msg_g2_1 = near_sdk::env::bls12381_map_fp2_to_g2(&msg_fp2_1);
 
-        let msg_g2 = near_sdk::env::bls12381_p2_sum(msg_g2_01_sign.as_slice());
-        let pubkeys_ser: Vec<u8> = pubkeys.concat();
+        // 4. Sum the G2 points with sign bits
+        let mut msg_g2_points = Vec::with_capacity(1 + msg_g2_0.len() + 1 + msg_g2_1.len());
+        msg_g2_points.push(0); // Sign bit (positive)
+        msg_g2_points.extend_from_slice(&msg_g2_0);
+        msg_g2_points.push(0); // Sign bit (positive)
+        msg_g2_points.extend_from_slice(&msg_g2_1);
 
-        let pks_decompress = near_sdk::env::bls12381_p1_decompress(&pubkeys_ser);
-        let mut pks_decompress_with_sign = vec![0u8; 0];
-        for i in 0..pks_decompress.len() / 96 {
-            pks_decompress_with_sign.push(0);
-            pks_decompress_with_sign.extend(&pks_decompress[i * 96..(i + 1) * 96]);
-        }
-
-        let pk_agg = near_sdk::env::bls12381_p1_sum(&pks_decompress_with_sign);
-
-        let mut gen = ECP::generator();
-        gen.neg();
-        let gneg = serialize_uncompressed_g1(&gen);
-
-        let sig_des = near_sdk::env::bls12381_p2_decompress(&signature);
-        let pairing_input = vec![pk_agg, msg_g2, gneg.to_vec(), sig_des].concat();
-
-        return near_sdk::env::bls12381_pairing_check(&pairing_input);
+        near_sdk::env::bls12381_p2_sum(&msg_g2_points)
     }
 
+    /// Aggregates multiple public keys into a single public key
+    fn aggregate_public_keys(pubkeys: Vec<Vec<u8>>) -> Vec<u8> {
+        // 1. Concatenate all compressed public keys
+        let pubkeys_serialized: Vec<u8> = pubkeys.concat();
+
+        // 2. Decompress all public keys
+        let pks_decompressed = near_sdk::env::bls12381_p1_decompress(&pubkeys_serialized);
+
+        // 3. Prepare public keys with sign bits for summation
+        let mut pks_with_sign =
+            Vec::with_capacity(pks_decompressed.len() + pks_decompressed.len() / 96);
+        for i in 0..pks_decompressed.len() / 96 {
+            pks_with_sign.push(0); // Sign bit (positive)
+            pks_with_sign.extend_from_slice(&pks_decompressed[i * 96..(i + 1) * 96]);
+        }
+
+        // 4. Sum all public keys to get the aggregated key
+        near_sdk::env::bls12381_p1_sum(&pks_with_sign)
+    }
+
+    /// Converts an FP2 element to bytes in the format expected by NEAR runtime
     fn fp2_to_u8(u: &FP2, out: &mut [u8; 96]) {
+        // FP2 element consists of two FP elements (a, b)
+        // Write b first, then a (format expected by NEAR)
         u.getb().to_byte_array(&mut out[0..48], 0);
         u.geta().to_byte_array(&mut out[48..96], 0);
     }
@@ -92,8 +134,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_bls_signature() {
-        let (_, contract) = get_contract(WASM_FILEPATH).await;
-        assert!(call!(contract, "new").await);
+        let wasm = near_workspaces::compile_project(".").await.unwrap();
+
+        let worker = near_workspaces::sandbox().await.unwrap();
+        let contract = worker.dev_deploy(&wasm).await.unwrap();
 
         let config = get_config();
         let light_client_updates: Vec<LightClientUpdate> = serde_json::from_str(
